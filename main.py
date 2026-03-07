@@ -117,7 +117,7 @@ async def startup():
 
 # ── 타겟 모니터링 (Cron Job에서 호출) ──────────
 
-@app.post("/monitor")
+@app.api_route("/monitor", methods=["GET", "POST"])
 async def monitor_targets():
     """Render Cron Job에서 주기적으로 호출 - 타겟 선박 체크 후 변경 시 푸시 발송"""
     results = []
