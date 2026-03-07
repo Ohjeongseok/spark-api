@@ -106,82 +106,6 @@ def send_push_notification(fcm_token: str, title: str, body: str, data: dict = N
         return False
 
 
-# ── 타겟 모니터링 백그라운드 태스크 ────────────
-
-async def monitor_targets():
-    """15분~1시간 랜덤 간격으로 타겟 선박 체크 후 변경 시 푸시 발송"""
-    await asyncio.sleep(30)  # 서버 시작 후 30초 대기
-    while True:
-        try:
-            print("🔍 타겟 모니터링 시작...")
-            with get_conn() as conn:
-                with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                    cur.execute("SELECT * FROM targets WHERE fcm_token IS NOT NULL AND fcm_token != ''")
-                    targets = [dict(r) for r in cur.fetchall()]
-
-            print(f"📋 타겟 {len(targets)}개 확인 중...")
-
-            for target in targets:
-                try:
-                    user_id = target['user_id']
-                    port = target['port']
-                    vessel = target['vessel']
-                    last_key = target.get('last_key') or ''
-                    fcm_token = target['fcm_token']
-
-                    # 도선예보 조회
-                    loop = asyncio.get_event_loop()
-                    pob = await loop.run_in_executor(None, get_pob_info, vessel, port)
-
-                    if not pob:
-                        continue
-
-                    # 현재 상태 키 생성 (예보 내용으로 변경 감지)
-                    current_key = json.dumps(pob, ensure_ascii=False, sort_keys=True)
-
-                    if current_key != last_key:
-                        # 변경 감지!
-                        if last_key == '':
-                            # 새로 등록된 경우
-                            title = f"🚢 {vessel} 도선예보 등록"
-                            body = f"{port} 항구 도선예보가 등록됐습니다"
-                        else:
-                            # 내용 변경된 경우
-                            title = f"🔔 {vessel} 도선예보 변경"
-                            body = f"{port} 항구 도선예보 내용이 변경됐습니다"
-
-                        # 푸시 발송
-                        send_push_notification(fcm_token, title, body, {
-                            "port": port,
-                            "vessel": vessel,
-                        })
-
-                        # DB 업데이트
-                        with get_conn() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    "UPDATE targets SET last_key = %s WHERE user_id = %s AND port = %s AND vessel = %s",
-                                    (current_key, user_id, port, vessel)
-                                )
-                            conn.commit()
-
-                        print(f"✅ {vessel}({port}) 변경 감지 → 푸시 발송")
-                    else:
-                        print(f"⏸ {vessel}({port}) 변경 없음")
-
-                except Exception as e:
-                    print(f"❌ {target['vessel']} 체크 실패: {e}")
-                    continue
-
-        except Exception as e:
-            print(f"❌ 모니터링 오류: {e}")
-
-        # 15분~1시간 랜덤 대기
-        wait = random.randint(15 * 60, 60 * 60)
-        print(f"⏰ 다음 체크까지 {wait // 60}분 대기...")
-        await asyncio.sleep(wait)
-
-
 @app.on_event("startup")
 async def startup():
     try:
@@ -189,8 +113,77 @@ async def startup():
     except Exception as e:
         print(f"DB 초기화 실패: {e}")
     init_firebase()
-    # 백그라운드 모니터링 시작
-    asyncio.create_task(monitor_targets())
+
+
+# ── 타겟 모니터링 (Cron Job에서 호출) ──────────
+
+@app.post("/monitor")
+async def monitor_targets():
+    """Render Cron Job에서 주기적으로 호출 - 타겟 선박 체크 후 변경 시 푸시 발송"""
+    results = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SELECT * FROM targets WHERE fcm_token IS NOT NULL AND fcm_token != ''")
+                targets = [dict(r) for r in cur.fetchall()]
+
+        print(f"🔍 타겟 {len(targets)}개 확인 중...")
+
+        for target in targets:
+            try:
+                user_id = target['user_id']
+                port = target['port']
+                vessel = target['vessel']
+                last_key = target.get('last_key') or ''
+                fcm_token = target['fcm_token']
+
+                # 도선예보 조회
+                loop = asyncio.get_event_loop()
+                pob = await loop.run_in_executor(None, get_pob_info, vessel, port)
+
+                if not pob:
+                    results.append({"vessel": vessel, "status": "no_data"})
+                    continue
+
+                # 현재 상태 키 생성
+                current_key = json.dumps(pob, ensure_ascii=False, sort_keys=True)
+
+                if current_key != last_key:
+                    if last_key == '':
+                        title = f"🚢 {vessel} 도선예보 등록"
+                        body = f"{port} 항구 도선예보가 등록됐습니다"
+                    else:
+                        title = f"🔔 {vessel} 도선예보 변경"
+                        body = f"{port} 항구 도선예보 내용이 변경됐습니다"
+
+                    send_push_notification(fcm_token, title, body, {
+                        "port": port,
+                        "vessel": vessel,
+                    })
+
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                "UPDATE targets SET last_key = %s WHERE user_id = %s AND port = %s AND vessel = %s",
+                                (current_key, user_id, port, vessel)
+                            )
+                        conn.commit()
+
+                    print(f"✅ {vessel}({port}) 변경 감지 → 푸시 발송")
+                    results.append({"vessel": vessel, "status": "pushed"})
+                else:
+                    print(f"⏸ {vessel}({port}) 변경 없음")
+                    results.append({"vessel": vessel, "status": "no_change"})
+
+            except Exception as e:
+                print(f"❌ {target['vessel']} 체크 실패: {e}")
+                results.append({"vessel": target['vessel'], "status": "error", "error": str(e)})
+
+    except Exception as e:
+        print(f"❌ 모니터링 오류: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"checked": len(results), "results": results}
 
 
 @app.get("/")
