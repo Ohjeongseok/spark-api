@@ -223,8 +223,12 @@ async def search_vessel(port: str, vessel: str):
         raise HTTPException(status_code=400, detail=f"지원하지 않는 항구: {port}")
 
     loop = asyncio.get_event_loop()
-    pob = await loop.run_in_executor(None, get_pob_info, vessel, port)
-    ais = await loop.run_in_executor(None, get_vessel_info, vessel)
+    # pob(도선예보)와 ais(실시간 위치)를 동시에 조회해서 대기 시간을 줄인다
+    # (순차 실행 시 최악의 경우 pob 시간 + AIS 최대 대기(10초)가 그대로 더해짐)
+    pob, ais = await asyncio.gather(
+        loop.run_in_executor(None, get_pob_info, vessel, port),
+        loop.run_in_executor(None, get_vessel_info, vessel),
+    )
 
     return {
         "port": port,
