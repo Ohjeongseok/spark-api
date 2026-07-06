@@ -15,7 +15,7 @@ import logging
 import firebase_admin
 from firebase_admin import credentials, messaging
 from scraper.pilot_station import get_pob_info, get_all_pob_info
-from scraper.marinetraffic import get_vessel_info
+from scraper.marinetraffic import get_vessel_info, start_ais_listener
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -116,6 +116,10 @@ async def startup():
     except Exception as e:
         print(f"DB 초기화 실패: {e}")
     init_firebase()
+    # AIS 백그라운드 리스너: 서버가 켜져 있는 동안 계속 한반도 연안 AIS 신호를
+    # 수신해서 캐시에 쌓아둔다. 검색 시점에는 이 캐시를 즉시 조회하므로
+    # 매 요청마다 새로 연결해서 짧게 기다리는 것보다 훨씬 빠르고 적중률이 높다.
+    asyncio.create_task(start_ais_listener())
 
 
 # ── 타겟 모니터링 (Cron Job에서 호출) ──────────
