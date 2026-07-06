@@ -36,10 +36,13 @@ async def _fetch_ais(vessel_name: str, timeout: int = 10) -> dict | None:
     vessel_clean = vessel_name.strip().upper()
     vessel_nospace = vessel_clean.replace(" ", "")
 
+    # 전세계 범위로 구독하면 초당 메시지량이 너무 많아 짧은 대기시간(10초) 내에
+    # 원하는 선박의 신호를 잡기 어렵다. 검색 대상이 전부 한국 항구(포항/마산/부산/울산/여수)이므로
+    # 한반도 연안 해역으로 범위를 좁혀서 신호를 훨씬 빠르고 안정적으로 잡는다.
     subscribe_msg = {
         "APIKey": api_key,
         "MessageType": "subscribe",
-        "BoundingBoxes": [[[-90, -180], [90, 180]]],
+        "BoundingBoxes": [[[32.0, 123.0], [39.5, 132.5]]],
         "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
     }
 
