@@ -12,10 +12,10 @@ logger = logging.getLogger(__name__)
 AISSTREAM_WS_URL = "wss://stream.aisstream.io/v0/stream"
 
 
-def get_vessel_info(vessel_name: str) -> dict | None:
+def get_vessel_info(vessel_name: str, timeout: int = 10) -> dict | None:
     try:
         loop = asyncio.new_event_loop()
-        result = loop.run_until_complete(_fetch_ais(vessel_name))
+        result = loop.run_until_complete(_fetch_ais(vessel_name, timeout=timeout))
         loop.close()
         return result
     except Exception as e:
@@ -23,7 +23,7 @@ def get_vessel_info(vessel_name: str) -> dict | None:
         return None
 
 
-async def _fetch_ais(vessel_name: str, timeout: int = 30) -> dict | None:
+async def _fetch_ais(vessel_name: str, timeout: int = 10) -> dict | None:
     api_key = os.environ.get("AISSTREAM_API_KEY", "").strip()
     key_preview = api_key[:8] if api_key else "없음"
     logger.info(f"AISSTREAM KEY: {key_preview}")
