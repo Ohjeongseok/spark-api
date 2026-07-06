@@ -193,8 +193,10 @@ async def monitor_targets():
     return {"checked": len(results), "results": results}
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
+    # UptimeRobot 등 무료 플랜 모니터링 서비스는 HEAD 요청으로 상태를 체크하는데,
+    # HEAD를 명시적으로 허용하지 않으면 405가 나서 "다운"으로 오탐지된다.
     return {"status": "ok", "message": "Spark Mobile API"}
 
 
