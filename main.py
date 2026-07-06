@@ -13,7 +13,7 @@ import json
 import random
 import firebase_admin
 from firebase_admin import credentials, messaging
-from scraper.pilot_station import get_pob_info
+from scraper.pilot_station import get_pob_info, get_all_pob_info
 from scraper.marinetraffic import get_vessel_info
 
 app = FastAPI(title="Spark Mobile API")
@@ -194,6 +194,24 @@ def root():
 @app.get("/ports")
 def get_ports():
     return {"ports": SUPPORTED_PORTS}
+
+
+@app.get("/schedule/{port}")
+async def get_schedule(port: str):
+    """지정 항구의 도선예보 전체 목록 (타겟 등록 없이 바로 조회)"""
+    port_key = None
+    for p in SUPPORTED_PORTS:
+        if p.upper() == port.upper():
+            port_key = p
+            break
+
+    if not port_key:
+        raise HTTPException(status_code=400, detail=f"지원하지 않는 항구: {port}")
+
+    loop = asyncio.get_event_loop()
+    vessels = await loop.run_in_executor(None, get_all_pob_info, port_key)
+
+    return {"port": port_key, "count": len(vessels), "vessels": vessels}
 
 
 @app.get("/search/{port}/{vessel}")
