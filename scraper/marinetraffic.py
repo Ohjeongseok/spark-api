@@ -22,8 +22,10 @@ import websockets
 logger = logging.getLogger(__name__)
 AISSTREAM_WS_URL = "wss://stream.aisstream.io/v0/stream"
 
-# 한반도 연안 해역 (포항/마산·삼천포/부산/울산/여수·광양·하동 전부 포함)
-KOREA_BOUNDING_BOX = [[32.0, 123.0], [39.5, 132.5]]
+# 동아시아 해역 (한국 전 연안 + 중국 연안 + 일본 전역)
+# 선박이 한국에 들어오기 전, 출항지인 중국/일본 항구에 있을 때부터
+# 위치를 추적할 수 있도록 범위를 한반도에서 동아시아 전체로 넓혔다.
+EAST_ASIA_BOUNDING_BOX = [[18.0, 108.0], [46.0, 146.0]]
 
 # 선박명(공백 제거, 대문자 정규화) -> 최신 위치 정보
 _AIS_CACHE: dict[str, dict] = {}
@@ -44,7 +46,7 @@ async def start_ais_listener():
     subscribe_msg = {
         "APIKey": api_key,
         "MessageType": "subscribe",
-        "BoundingBoxes": [KOREA_BOUNDING_BOX],
+        "BoundingBoxes": [EAST_ASIA_BOUNDING_BOX],
         "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
     }
 
@@ -52,7 +54,7 @@ async def start_ais_listener():
         try:
             async with websockets.connect(AISSTREAM_WS_URL, ping_timeout=20) as ws:
                 await ws.send(json.dumps(subscribe_msg))
-                logger.info("AISstream 백그라운드 연결 성공 - 한반도 연안 수신 시작")
+                logger.info("AISstream 백그라운드 연결 성공 - 동아시아 해역 수신 시작")
                 count = 0
                 async for raw in ws:
                     count += 1
