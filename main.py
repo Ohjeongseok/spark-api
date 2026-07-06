@@ -26,7 +26,7 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-SUPPORTED_PORTS = ["포항", "마산"]
+SUPPORTED_PORTS = ["포항", "마산", "부산", "울산", "여수"]
 
 # Firebase Admin SDK 초기화
 _firebase_initialized = False
