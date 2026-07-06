@@ -37,6 +37,26 @@ def get_pob_info(vessel_name: str, port: str = None) -> dict | None:
     return None
 
 
+def get_all_pob_info(port: str) -> list[dict]:
+    """지정 항구의 도선예보 전체 목록 반환 (선박명 필터 없음)"""
+    if port not in PILOT_STATION_URLS:
+        return []
+
+    config = PILOT_STATION_URLS[port]
+    logger.info(f"{port} 예도선 전체 목록 조회 중")
+
+    if port == "마산":
+        results = _parse_masan_pilot_all(config["url"])
+    elif port == "포항":
+        results = _parse_pohang_pilot_all(config)
+    else:
+        results = []
+
+    for r in results:
+        r["port"] = port
+    return results
+
+
 def _login_pohang(config: dict) -> requests.Session | None:
     session = requests.Session()
     session.headers.update(HEADERS)
@@ -139,6 +159,69 @@ def _parse_pohang_pilot(vessel_name: str, config: dict) -> dict | None:
     return None
 
 
+def _parse_pohang_pilot_all(config: dict) -> list[dict]:
+    """포항 도선사회 - 전체 선박 목록 (선박명 필터 없음)"""
+    session = _login_pohang(config)
+    if not session:
+        return []
+
+    results = []
+    try:
+        resp = session.get(
+            "http://www.dsmarine.co.kr/order/order_view.asp",
+            timeout=REQUEST_TIMEOUT
+        )
+        resp.encoding = "euc-kr"
+
+        if resp.status_code != 200:
+            logger.error(f"포항 페이지 접근 실패: {resp.status_code}")
+            return []
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        tables = soup.find_all("table")
+
+        for table in tables:
+            for row in table.find_all("tr"):
+                cells = row.find_all("td")
+
+                if len(cells) < 8:
+                    continue
+
+                ship_name_raw = cells[0].get_text(strip=True)
+
+                if len(ship_name_raw) > 30:
+                    continue
+                if not re.search(r'[A-Za-z]', ship_name_raw):
+                    continue
+
+                gt_loa    = cells[1].get_text(strip=True)
+                from_to   = cells[3].get_text(strip=True)
+                tug       = cells[4].get_text(strip=True)
+                pilot     = cells[5].get_text(strip=True)
+                work_time = cells[6].get_text(strip=True)
+                agent     = cells[7].get_text(strip=True) if len(cells) > 7 else "N/A"
+                remark    = cells[8].get_text(strip=True) if len(cells) > 8 else "N/A"
+
+                results.append({
+                    "ship_name":  ship_name_raw,
+                    "gt_loa":     gt_loa,
+                    "status":     _get_move_type(from_to),
+                    "from_to":    from_to,
+                    "pilot_time": work_time,
+                    "tug":        tug,
+                    "pilot":      pilot,
+                    "agent":      agent,
+                    "berth":      remark,
+                })
+
+        logger.info(f"포항 전체 목록: {len(results)}건")
+
+    except Exception as e:
+        logger.error(f"포항 전체 목록 파싱 실패: {e}")
+
+    return results
+
+
 def _get_move_type(from_to: str) -> str:
     ft = from_to.upper().replace(" ", "")
     if ft.startswith("PS"):
@@ -199,6 +282,42 @@ def _parse_masan_pilot(vessel_name: str, url: str) -> dict | None:
             "berth":      cells[-1].get_text(strip=True),
         }
     return None
+
+
+def _parse_masan_pilot_all(url: str) -> list[dict]:
+    """마산 도선사회 - 전체 선박 목록 (선박명 필터 없음)"""
+    soup = _fetch_page(url)
+    if not soup:
+        return []
+
+    table = soup.find("table")
+    if not table:
+        return []
+
+    results = []
+    for row in table.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 11:
+            continue
+
+        from_to = f"{cells[9].get_text(strip=True)} → {cells[10].get_text(strip=True)}"
+        move_type = _get_move_type(
+            cells[9].get_text(strip=True) + "→" + cells[10].get_text(strip=True)
+        )
+        results.append({
+            "ship_name":  cells[3].get_text(strip=True),
+            "callsign":   cells[4].get_text(strip=True),
+            "agent":      cells[5].get_text(strip=True),
+            "gross_ton":  f"{cells[6].get_text(strip=True)} G/T",
+            "draft":      f"{cells[7].get_text(strip=True)} m",
+            "status":     f"{cells[8].get_text(strip=True)} ({move_type})",
+            "pilot_time": f"{cells[1].get_text(strip=True)}일 {cells[2].get_text(strip=True)}",
+            "from_to":    from_to,
+            "berth":      cells[-1].get_text(strip=True),
+        })
+
+    logger.info(f"마산 전체 목록: {len(results)}건")
+    return results
 
 
 def _parse_generic_pilot(vessel_name: str, url: str) -> dict | None:
