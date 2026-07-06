@@ -11,10 +11,13 @@ import os
 import asyncio
 import json
 import random
+import logging
 import firebase_admin
 from firebase_admin import credentials, messaging
 from scraper.pilot_station import get_pob_info, get_all_pob_info
 from scraper.marinetraffic import get_vessel_info
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 app = FastAPI(title="Spark Mobile API")
 
