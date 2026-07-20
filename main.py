@@ -84,21 +84,29 @@ def init_db():
 
 # ── 푸시 알림 전송 ──────────────────────────
 
-def send_push_notification(fcm_token: str, title: str, body: str, data: dict = None):
+def send_push_notification(fcm_token: str, title: str, body: str, data: dict = None, channel_id: str = None):
     if not _firebase_initialized:
         print("Firebase 미초기화 - 알림 전송 건너뜀")
         return False
     try:
+        # 도선예보 "등록"과 "변경"은 서로 다른 알림음을 쓴다.
+        # Android 8+ 에서는 채널 생성 시점에 고정된 소리가 우선 적용되므로
+        # (앱에서 pilot_registered_channel / schedule_changed_channel 을 미리 만들어둠)
+        # channel_id 로 구분해서 보내고, 구버전 Android를 위해 sound 필드도 함께 지정한다.
+        android_notification_kwargs = {"priority": "high"}
+        if channel_id:
+            android_notification_kwargs["channel_id"] = channel_id
+            android_notification_kwargs["sound"] = channel_id.replace("_channel", "")
+        else:
+            android_notification_kwargs["sound"] = "default"
+
         message = messaging.Message(
             notification=messaging.Notification(title=title, body=body),
             data={k: str(v) for k, v in (data or {}).items()},
             token=fcm_token,
             android=messaging.AndroidConfig(
                 priority="high",
-                notification=messaging.AndroidNotification(
-                    sound="default",
-                    priority="high",
-                ),
+                notification=messaging.AndroidNotification(**android_notification_kwargs),
             ),
         )
         response = messaging.send(message)
@@ -159,14 +167,16 @@ async def monitor_targets():
                     if last_key == '':
                         title = f"🚢 {vessel} 도선예보 등록"
                         body = f"{port} 항구 도선예보가 등록됐습니다"
+                        channel_id = "pilot_registered_channel"
                     else:
                         title = f"🔔 {vessel} 도선예보 변경"
                         body = f"{port} 항구 도선예보 내용이 변경됐습니다"
+                        channel_id = "schedule_changed_channel"
 
                     send_push_notification(fcm_token, title, body, {
                         "port": port,
                         "vessel": vessel,
-                    })
+                    }, channel_id=channel_id)
 
                     with get_conn() as conn:
                         with conn.cursor() as cur:
