@@ -30,6 +30,7 @@ app.add_middleware(
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 SUPPORTED_PORTS = ["포항", "마산", "부산", "울산", "여수"]
+MISSING_RESET_THRESHOLD = 3  # 예보 연속 미검출 n회 → 타겟 상태 초기화
 
 # Firebase Admin SDK 초기화
 _firebase_initialized = False
@@ -72,6 +73,9 @@ def init_db():
                     UNIQUE(user_id, port, vessel)
                 )
             """)
+            # 예보가 연속으로 몇 번 안 보였는지. 일정 횟수 이상이면 last_key를 비워
+            # 같은 선박이 다시 잡힐 때 "변경"이 아니라 "등록" 알림이 가도록 한다.
+            cur.execute("ALTER TABLE targets ADD COLUMN IF NOT EXISTS missing_count INTEGER DEFAULT 0")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS fcm_tokens (
                     user_id TEXT PRIMARY KEY,
@@ -139,7 +143,16 @@ async def monitor_targets():
     try:
         with get_conn() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute("SELECT * FROM targets WHERE fcm_token IS NOT NULL AND fcm_token != ''")
+                # 타겟 저장 시점에 FCM 토큰이 아직 없었던 경우(앱 첫 실행 직후)를 위해
+                # fcm_tokens 테이블의 최신 토큰으로 보완한다.
+                cur.execute("""
+                    SELECT t.user_id, t.port, t.vessel, t.last_key,
+                           COALESCE(NULLIF(t.fcm_token, ''), f.token) AS fcm_token,
+                           COALESCE(t.missing_count, 0) AS missing_count
+                    FROM targets t
+                    LEFT JOIN fcm_tokens f ON f.user_id = t.user_id
+                    WHERE COALESCE(NULLIF(t.fcm_token, ''), f.token) IS NOT NULL
+                """)
                 targets = [dict(r) for r in cur.fetchall()]
 
         print(f"🔍 타겟 {len(targets)}개 확인 중...")
@@ -157,7 +170,24 @@ async def monitor_targets():
                 pob = await loop.run_in_executor(None, get_pob_info, vessel, port)
 
                 if not pob:
-                    results.append({"vessel": vessel, "status": "no_data"})
+                    # 스크래퍼 일시 장애로 한두 번 비는 건 무시하고, 연속 3회(≈45분) 이상
+                    # 안 보이면 예보가 실제로 내려간 것으로 보고 last_key를 초기화한다.
+                    missing = int(target.get('missing_count') or 0) + 1
+                    with get_conn() as conn:
+                        with conn.cursor() as cur:
+                            if missing >= MISSING_RESET_THRESHOLD and last_key:
+                                cur.execute(
+                                    "UPDATE targets SET last_key = '', missing_count = 0 WHERE user_id = %s AND port = %s AND vessel = %s",
+                                    (user_id, port, vessel)
+                                )
+                                print(f"🧹 {vessel}({port}) 예보 {missing}회 연속 미검출 → 상태 초기화")
+                            else:
+                                cur.execute(
+                                    "UPDATE targets SET missing_count = %s WHERE user_id = %s AND port = %s AND vessel = %s",
+                                    (missing, user_id, port, vessel)
+                                )
+                        conn.commit()
+                    results.append({"vessel": vessel, "status": "no_data", "missing_count": missing})
                     continue
 
                 # 현재 상태 키 생성
@@ -181,7 +211,7 @@ async def monitor_targets():
                     with get_conn() as conn:
                         with conn.cursor() as cur:
                             cur.execute(
-                                "UPDATE targets SET last_key = %s WHERE user_id = %s AND port = %s AND vessel = %s",
+                                "UPDATE targets SET last_key = %s, missing_count = 0 WHERE user_id = %s AND port = %s AND vessel = %s",
                                 (current_key, user_id, port, vessel)
                             )
                         conn.commit()
@@ -189,6 +219,14 @@ async def monitor_targets():
                     print(f"✅ {vessel}({port}) 변경 감지 → 푸시 발송")
                     results.append({"vessel": vessel, "status": "pushed"})
                 else:
+                    if int(target.get('missing_count') or 0) > 0:
+                        with get_conn() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    "UPDATE targets SET missing_count = 0 WHERE user_id = %s AND port = %s AND vessel = %s",
+                                    (user_id, port, vessel)
+                                )
+                            conn.commit()
                     print(f"⏸ {vessel}({port}) 변경 없음")
                     results.append({"vessel": vessel, "status": "no_change"})
 
@@ -323,14 +361,19 @@ def add_target(req: TargetRequest):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # xmax = 0 이면 새 행(INSERT), 아니면 기존 행 갱신(UPDATE) — 앱이
+                # "등록됨"과 "이미 등록된 선박"을 구분해서 안내할 수 있게 created 플래그를 준다.
+                # 기존 토큰이 비어 있지 않은데 빈 토큰이 오면 덮어쓰지 않는다.
                 cur.execute("""
                     INSERT INTO targets (user_id, port, vessel, fcm_token)
                     VALUES (%s, %s, %s, %s)
                     ON CONFLICT (user_id, port, vessel)
-                    DO UPDATE SET fcm_token = EXCLUDED.fcm_token
+                    DO UPDATE SET fcm_token = COALESCE(NULLIF(EXCLUDED.fcm_token, ''), targets.fcm_token)
+                    RETURNING (xmax = 0) AS created
                 """, (req.user_id, req.port.upper(), req.vessel.upper(), req.fcm_token))
+                created = bool(cur.fetchone()[0])
             conn.commit()
-        return {"success": True}
+        return {"success": True, "created": created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
