@@ -12,6 +12,7 @@ import asyncio
 import json
 import random
 import logging
+import time
 import firebase_admin
 from firebase_admin import credentials, messaging
 from scraper.pilot_station import get_pob_info, get_all_pob_info
@@ -76,6 +77,15 @@ def init_db():
             # 예보가 연속으로 몇 번 안 보였는지. 일정 횟수 이상이면 last_key를 비워
             # 같은 선박이 다시 잡힐 때 "변경"이 아니라 "등록" 알림이 가도록 한다.
             cur.execute("ALTER TABLE targets ADD COLUMN IF NOT EXISTS missing_count INTEGER DEFAULT 0")
+            # 선박별 마지막으로 잡힌 AIS 위치. AIS 캐시는 메모리라 서버가 재시작되거나
+            # 선박이 수신 범위를 벗어나면 사라지므로, "마지막으로 본 위치"를 DB에 남겨둔다.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ais_last_seen (
+                    vessel TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    seen_at DOUBLE PRECISION NOT NULL
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS fcm_tokens (
                     user_id TEXT PRIMARY KEY,
@@ -84,6 +94,103 @@ def init_db():
                 )
             """)
         conn.commit()
+
+
+# ── AIS 마지막 위치 보존 ──────────────────────
+
+def _vessel_key(name: str) -> str:
+    return (name or "").strip().upper().replace(" ", "")
+
+
+def remember_ais(vessel: str, ais: dict | None):
+    """실시간 AIS가 잡혔을 때 DB에 마지막 위치로 저장 (실패해도 조회 자체는 계속)."""
+    if not ais or ais.get("lat") is None or ais.get("lon") is None:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO ais_last_seen (vessel, data, seen_at) VALUES (%s, %s, %s)
+                    ON CONFLICT (vessel) DO UPDATE SET data = EXCLUDED.data, seen_at = EXCLUDED.seen_at
+                """, (_vessel_key(vessel), json.dumps(ais, ensure_ascii=False),
+                      float(ais.get("updated_at") or time.time())))
+            conn.commit()
+    except Exception as e:
+        print(f"AIS 마지막 위치 저장 실패: {e}")
+
+
+def load_last_ais(vessel: str) -> dict | None:
+    """실시간 AIS가 없을 때 보여줄 마지막 위치. stale=True 와 updated_at(수신 시각)을 붙여준다."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT data, seen_at FROM ais_last_seen WHERE vessel = %s", (_vessel_key(vessel),))
+                row = cur.fetchone()
+        if not row:
+            return None
+        data = json.loads(row[0])
+        data["updated_at"] = int(row[1])
+        data["stale"] = True
+        return data
+    except Exception as e:
+        print(f"AIS 마지막 위치 조회 실패: {e}")
+        return None
+
+
+def lookup_ais(vessel: str) -> tuple[dict | None, dict | None]:
+    """(실시간 ais, 마지막 위치 last_ais). 실시간이 있으면 저장하고 last_ais는 None."""
+    ais = get_vessel_info(vessel)
+    if ais:
+        remember_ais(vessel, ais)
+        return ais, None
+    return None, load_last_ais(vessel)
+
+
+# ── 도선예보 변경 내용 요약 ────────────────────
+
+_CHANGE_LABELS = [
+    ("pilot_time", "작업일시"),
+    ("status", "상태"),
+    ("from_to", "From→To"),
+    ("berth", "선석/비고"),
+    ("pilot", "도선사"),
+    ("tug", "예선"),
+    ("berth_side", "접현"),
+    ("draft", "흘수"),
+    ("agent", "대리점"),
+]
+
+
+def _clean(v) -> str:
+    return " ".join(str(v if v is not None else "").split())
+
+
+def summarize_pob(pob: dict) -> str:
+    """등록 알림용 한 줄 요약: 작업일시 · 상태 · From→To"""
+    parts = [_clean(pob.get(k)) for k in ("pilot_time", "status", "from_to")]
+    return " · ".join(p for p in parts if p and p != "N/A")
+
+
+def describe_changes(old_key: str, pob: dict) -> str:
+    """이전 상태(JSON 문자열)와 현재 예보를 비교해 무엇이 바뀌었는지 설명한다."""
+    try:
+        old = json.loads(old_key) if old_key else {}
+    except Exception:
+        old = {}
+    if not isinstance(old, dict):
+        old = {}
+    changes = []
+    for field, label in _CHANGE_LABELS:
+        before, after = _clean(old.get(field)), _clean(pob.get(field))
+        if before == after:
+            continue
+        if before and after:
+            changes.append(f"{label} {before} → {after}")
+        elif after:
+            changes.append(f"{label} {after}")
+        else:
+            changes.append(f"{label} 삭제")
+    return "\n".join(changes[:4])
 
 
 # ── 푸시 알림 전송 ──────────────────────────
@@ -196,11 +303,13 @@ async def monitor_targets():
                 if current_key != last_key:
                     if last_key == '':
                         title = f"🚢 {vessel} 도선예보 등록"
-                        body = f"{port} 항구 도선예보가 등록됐습니다"
+                        summary = summarize_pob(pob)
+                        body = f"{port}항 · {summary}" if summary else f"{port} 항구 도선예보가 등록됐습니다"
                         channel_id = "pilot_registered_channel"
                     else:
                         title = f"🔔 {vessel} 도선예보 변경"
-                        body = f"{port} 항구 도선예보 내용이 변경됐습니다"
+                        # 무엇이 바뀌었는지(예: 작업일시 14:00 → 16:30)를 본문에 보여준다
+                        body = describe_changes(last_key, pob) or f"{port} 항구 도선예보 내용이 변경됐습니다"
                         channel_id = "schedule_changed_channel"
 
                     send_push_notification(fcm_token, title, body, {
@@ -282,16 +391,17 @@ async def search_vessel(port: str, vessel: str):
     loop = asyncio.get_event_loop()
     # pob(도선예보)와 ais(실시간 위치)를 동시에 조회해서 대기 시간을 줄인다
     # (순차 실행 시 최악의 경우 pob 시간 + AIS 최대 대기(10초)가 그대로 더해짐)
-    pob, ais = await asyncio.gather(
+    pob, (ais, last_ais) = await asyncio.gather(
         loop.run_in_executor(None, get_pob_info, vessel, port),
-        loop.run_in_executor(None, get_vessel_info, vessel),
+        loop.run_in_executor(None, lookup_ais, vessel),
     )
 
     return {
         "port": port,
         "vessel": vessel,
         "pob": pob,
-        "ais": ais,
+        "ais": ais,            # 최근 30분 이내 실시간 위치 (없으면 null)
+        "last_ais": last_ais,  # 실시간이 없을 때: 마지막으로 잡혔던 위치 (stale=true, updated_at 포함)
     }
 
 
@@ -404,3 +514,43 @@ def get_targets(user_id: str):
         return {"targets": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/targets/{user_id}/details")
+async def get_target_details(user_id: str):
+    """타겟 목록 + 각 선박의 도선예보/AIS 위치를 한 번에 돌려준다.
+    (타겟 탭 카드와 '전체 지도' 화면용 — 선박마다 /search를 따로 부르지 않아도 된다)"""
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SELECT port, vessel, last_key FROM targets WHERE user_id=%s ORDER BY id", (user_id,))
+                rows = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    loop = asyncio.get_event_loop()
+    # 항구별 예보 목록은 한 번씩만 긁는다 (같은 항구 타겟이 여러 척이어도 1회)
+    ports = sorted({r["port"] for r in rows if r["port"] in SUPPORTED_PORTS})
+    schedules = await asyncio.gather(*[loop.run_in_executor(None, get_all_pob_info, p) for p in ports])
+    by_port = dict(zip(ports, schedules))
+
+    def find_pob(port: str, vessel: str):
+        v = vessel.strip().upper()
+        for item in by_port.get(port, []):
+            if v and v in str(item.get("ship_name", "")).upper():
+                return item
+        return None
+
+    ais_pairs = await asyncio.gather(*[loop.run_in_executor(None, lookup_ais, r["vessel"]) for r in rows])
+
+    targets = []
+    for r, (ais, last_ais) in zip(rows, ais_pairs):
+        targets.append({
+            "port": r["port"],
+            "vessel": r["vessel"],
+            "watching": bool(r.get("last_key")),
+            "pob": find_pob(r["port"], r["vessel"]),
+            "ais": ais,
+            "last_ais": last_ais,
+        })
+    return {"targets": targets}
