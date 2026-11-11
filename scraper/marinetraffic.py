@@ -95,6 +95,7 @@ def _handle_message(msg: dict):
         "map_url": f"https://www.marinetraffic.com/en/ais/details/ships/mmsi:{mmsi}",
         "speed": existing.get("speed", "N/A"),
         "course": existing.get("course", "N/A"),
+        "heading": existing.get("heading"),
         "nav_status": existing.get("nav_status", "N/A"),
         "eta": existing.get("eta", "N/A"),
         "updated_at": time.time(),
@@ -104,6 +105,9 @@ def _handle_message(msg: dict):
         pos = msg.get("Message", {}).get("PositionReport", {})
         entry["speed"] = pos.get("Sog", "N/A")
         entry["course"] = pos.get("Cog", "N/A")
+        # TrueHeading 511 = 정보 없음. 그 경우 지도에서는 course(COG)로 방향을 대신 그린다.
+        th = pos.get("TrueHeading", 511)
+        entry["heading"] = th if isinstance(th, (int, float)) and 0 <= th < 360 else None
         entry["nav_status"] = _nav_status(pos.get("NavigationalStatus", 15))
     elif msg_type == "ShipStaticData":
         static = msg.get("Message", {}).get("ShipStaticData", {})
@@ -131,9 +135,12 @@ def get_vessel_info(vessel_name: str, timeout: int = 10) -> dict | None:
         return None
 
     if time.time() - hit["updated_at"] > _CACHE_MAX_AGE_SEC:
-        return None  # 너무 오래된 데이터는 신뢰하지 않음
+        return None  # 너무 오래된 데이터는 "현재 위치"로 신뢰하지 않음
 
-    return {k: v for k, v in hit.items() if k != "updated_at"}
+    # updated_at(수신 시각, epoch 초)도 함께 돌려줘서 앱이 "n분 전 위치"를 표시할 수 있게 한다.
+    out = dict(hit)
+    out["updated_at"] = int(hit["updated_at"])
+    return out
 
 
 def _format_eta(eta) -> str:
