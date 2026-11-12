@@ -1,12 +1,13 @@
 # Spark Mobile 알림 점검 스케줄러
-# PC나 Claude 앱이 꺼져 있어도 GitHub 서버에서 5분마다 /monitor 를 호출한다.
+# PC나 Claude 앱이 꺼져 있어도 GitHub 서버에서 10분마다 /monitor 를 호출한다.
 # (도선예보 등록·변경 알림 + 도선 임박 알림 판단이 모두 /monitor 안에서 이뤄짐)
-# 덤으로 Render 무료 서버가 잠들지 않아 AIS 위치 캐시도 계속 쌓인다.
+# 10분 간격: 도선사회 사이트에 부담을 덜 주면서, Render 무료 서버가 잠드는 기준(15분)보다
+# 짧아 서버도 계속 깨어 있다 (AIS 위치 캐시도 계속 쌓임).
 name: Monitor targets
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다 (GitHub 사정에 따라 몇 분씩 늦어질 수 있음)
+    - cron: "*/10 * * * *"  # 10분마다 (GitHub 사정에 따라 몇 분씩 늦어질 수 있음)
   workflow_dispatch:         # Actions 탭에서 수동 실행 가능
 
 concurrency:
