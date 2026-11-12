@@ -40,6 +40,41 @@ KST = timezone(timedelta(hours=9), "KST")  # 한국은 서머타임이 없어 �
 # /monitor가 겹쳐 실행되면(이전 실행이 아직 안 끝났는데 다음 호출이 오는 경우) 같은 알림이
 # 두 번 갈 수 있으므로 한 번에 하나만 돌게 한다.
 _monitor_lock = asyncio.Lock()
+_monitor_task: asyncio.Task | None = None
+_last_monitor: dict = {}
+
+# 점검용 타겟 목록 메모리 캐시.
+# Neon 무료 DB는 5분간 쿼리가 없으면 잠들고, 깨어 있는 시간만큼 월 100 CU-시간에서 차감된다.
+# 10분마다 점검할 때마다 DB를 읽으면 DB가 거의 잠들지 못하므로, 타겟 목록은 메모리에 두고
+# 타겟/토큰이 바뀔 때(= 이 서버의 API를 통해서만 바뀜)만 다시 읽는다.
+# DB에는 실제로 알림을 보냈을 때만 쓴다.
+_targets_cache: list[dict] | None = None
+_missing: dict[tuple, int] = {}  # (user, port, vessel) -> 예보 연속 미검출 횟수 (메모리만)
+
+
+def invalidate_targets_cache():
+    global _targets_cache
+    _targets_cache = None
+
+
+def _load_targets() -> list[dict]:
+    global _targets_cache
+    if _targets_cache is None:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                # 타겟 저장 시점에 FCM 토큰이 아직 없었던 경우(앱 첫 실행 직후)를 위해
+                # fcm_tokens 테이블의 최신 토큰으로 보완한다.
+                cur.execute("""
+                    SELECT t.user_id, t.port, t.vessel, t.last_key,
+                           COALESCE(NULLIF(t.fcm_token, ''), f.token) AS fcm_token,
+                           t.reminded_for
+                    FROM targets t
+                    LEFT JOIN fcm_tokens f ON f.user_id = t.user_id
+                    WHERE COALESCE(NULLIF(t.fcm_token, ''), f.token) IS NOT NULL
+                """)
+                _targets_cache = [dict(r) for r in cur.fetchall()]
+        print(f"📥 타겟 목록 DB에서 다시 읽음: {len(_targets_cache)}개")
+    return _targets_cache
 
 # Firebase Admin SDK 초기화
 _firebase_initialized = False
@@ -274,6 +309,7 @@ def maybe_send_reminder(target: dict, pob: dict, fcm_token: str) -> str | None:
                 (pilot_time, target["user_id"], port, vessel),
             )
         conn.commit()
+    target["reminded_for"] = pilot_time  # 메모리 캐시도 갱신
     print(f"⏰ {vessel}({port}) 도선 {left}분 전 알림 발송")
     return f"reminded_{left}min"
 
@@ -326,36 +362,67 @@ async def startup():
     asyncio.create_task(start_ais_listener())
 
 
-# ── 타겟 모니터링 (Cron Job에서 호출) ──────────
+# ── 타겟 모니터링 (외부 스케줄러가 10분마다 호출) ──────────
 
-@app.api_route("/monitor", methods=["GET", "POST"])
-async def monitor_targets():
-    """외부 크론(GitHub Actions)이 주기적으로 호출 - 타겟 선박 체크 후 변경/임박 시 푸시 발송"""
-    if _monitor_lock.locked():
-        return {"checked": 0, "results": [], "skipped": "이전 점검이 아직 실행 중"}
-    async with _monitor_lock:
-        return await _run_monitor()
+async def _monitor_in_background():
+    global _last_monitor
+    started = time.time()
+    try:
+        async with _monitor_lock:
+            result = await _run_monitor()
+        _last_monitor = {"finished_at": int(time.time()), "seconds": round(time.time() - started, 1), **result}
+    except Exception as e:
+        _last_monitor = {"finished_at": int(time.time()), "error": str(e)}
+        print(f"❌ 백그라운드 점검 실패: {e}")
+
+
+@app.api_route("/monitor", methods=["GET", "HEAD", "POST"])
+async def monitor_targets(wait: bool = False):
+    """UptimeRobot 등이 주기적으로 호출. 점검은 오래 걸릴 수 있어(사이트 스크래핑) 기본은 뒤에서 돌리고
+    바로 200을 돌려준다 — 그래야 모니터링 서비스가 타임아웃을 '서버 다운'으로 오인하지 않는다.
+    ?wait=1 이면 점검이 끝날 때까지 기다렸다가 결과를 돌려준다 (수동 확인용)."""
+    global _monitor_task
+    if wait:
+        if _monitor_lock.locked():
+            return {"checked": 0, "results": [], "skipped": "이전 점검이 아직 실행 중"}
+        async with _monitor_lock:
+            return await _run_monitor()
+    if _monitor_task is not None and not _monitor_task.done():
+        return {"status": "running", "last": _last_monitor}
+    _monitor_task = asyncio.create_task(_monitor_in_background())
+    return {"status": "started", "last": _last_monitor}
 
 
 async def _run_monitor():
     results = []
     try:
-        with get_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                # 타겟 저장 시점에 FCM 토큰이 아직 없었던 경우(앱 첫 실행 직후)를 위해
-                # fcm_tokens 테이블의 최신 토큰으로 보완한다.
-                cur.execute("""
-                    SELECT t.user_id, t.port, t.vessel, t.last_key,
-                           COALESCE(NULLIF(t.fcm_token, ''), f.token) AS fcm_token,
-                           COALESCE(t.missing_count, 0) AS missing_count,
-                           t.reminded_for
-                    FROM targets t
-                    LEFT JOIN fcm_tokens f ON f.user_id = t.user_id
-                    WHERE COALESCE(NULLIF(t.fcm_token, ''), f.token) IS NOT NULL
-                """)
-                targets = [dict(r) for r in cur.fetchall()]
-
+        targets = await asyncio.get_event_loop().run_in_executor(None, _load_targets)
         print(f"🔍 타겟 {len(targets)}개 확인 중...")
+        if not targets:
+            return {"checked": 0, "results": []}
+
+        # 항구별 예보는 한 번씩만 긁는다 (같은 항구에 타겟이 여러 척이어도 1회).
+        # 도선사회 사이트 요청 수가 타겟 수와 무관하게 최대 항구 수(5)로 고정된다.
+        loop = asyncio.get_event_loop()
+        ports = sorted({t["port"] for t in targets})
+        schedules = await asyncio.gather(
+            *[loop.run_in_executor(None, get_all_pob_info, p) for p in ports],
+            return_exceptions=True,
+        )
+        by_port = {}
+        for p, sch in zip(ports, schedules):
+            if isinstance(sch, Exception) or not sch:
+                by_port[p] = None  # 사이트 장애/빈 응답: 이번 회차는 판단 보류
+                print(f"⚠️ {p} 예보 조회 실패/빈 목록: {sch if isinstance(sch, Exception) else 'empty'}")
+            else:
+                by_port[p] = sch
+
+        def find_pob(port: str, vessel: str):
+            v = vessel.strip().upper()
+            for item in by_port.get(port) or []:
+                if v and v in str(item.get("ship_name", "")).upper():
+                    return item
+            return None
 
         for target in targets:
             try:
@@ -364,33 +431,34 @@ async def _run_monitor():
                 vessel = target['vessel']
                 last_key = target.get('last_key') or ''
                 fcm_token = target['fcm_token']
+                mkey = (user_id, port, vessel)
 
-                # 도선예보 조회
-                loop = asyncio.get_event_loop()
-                pob = await loop.run_in_executor(None, get_pob_info, vessel, port)
+                if by_port.get(port) is None:
+                    results.append({"vessel": vessel, "status": "port_unavailable"})
+                    continue
+
+                pob = find_pob(port, vessel)
 
                 if not pob:
-                    # 스크래퍼 일시 장애로 한두 번 비는 건 무시하고, 연속 3회(≈45분) 이상
-                    # 안 보이면 예보가 실제로 내려간 것으로 보고 last_key를 초기화한다.
-                    missing = int(target.get('missing_count') or 0) + 1
-                    with get_conn() as conn:
-                        with conn.cursor() as cur:
-                            if missing >= MISSING_RESET_THRESHOLD and last_key:
+                    # 연속 3회(≈30분) 이상 예보에서 안 보이면 예보가 내려간 것으로 보고 상태를 초기화한다.
+                    # (다음에 다시 올라오면 "변경"이 아니라 "등록" 알림이 가도록). 횟수는 메모리에만 센다.
+                    missing = _missing.get(mkey, 0) + 1
+                    _missing[mkey] = missing
+                    if missing >= MISSING_RESET_THRESHOLD and last_key:
+                        with get_conn() as conn:
+                            with conn.cursor() as cur:
                                 cur.execute(
                                     "UPDATE targets SET last_key = '', missing_count = 0 WHERE user_id = %s AND port = %s AND vessel = %s",
                                     (user_id, port, vessel)
                                 )
-                                print(f"🧹 {vessel}({port}) 예보 {missing}회 연속 미검출 → 상태 초기화")
-                            else:
-                                cur.execute(
-                                    "UPDATE targets SET missing_count = %s WHERE user_id = %s AND port = %s AND vessel = %s",
-                                    (missing, user_id, port, vessel)
-                                )
-                        conn.commit()
+                            conn.commit()
+                        target['last_key'] = ''
+                        _missing.pop(mkey, None)
+                        print(f"🧹 {vessel}({port}) 예보 {missing}회 연속 미검출 → 상태 초기화")
                     results.append({"vessel": vessel, "status": "no_data", "missing_count": missing})
                     continue
 
-                # 현재 상태 키 생성
+                _missing.pop(mkey, None)
                 current_key = json.dumps(pob, ensure_ascii=False, sort_keys=True)
 
                 if current_key != last_key:
@@ -417,19 +485,11 @@ async def _run_monitor():
                                 (current_key, user_id, port, vessel)
                             )
                         conn.commit()
+                    target['last_key'] = current_key
 
                     print(f"✅ {vessel}({port}) 변경 감지 → 푸시 발송")
                     entry = {"vessel": vessel, "status": "pushed"}
                 else:
-                    if int(target.get('missing_count') or 0) > 0:
-                        with get_conn() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute(
-                                    "UPDATE targets SET missing_count = 0 WHERE user_id = %s AND port = %s AND vessel = %s",
-                                    (user_id, port, vessel)
-                                )
-                            conn.commit()
-                    print(f"⏸ {vessel}({port}) 변경 없음")
                     entry = {"vessel": vessel, "status": "no_change"}
 
                 # 도선 임박 알림 (변경 알림과 별개로 판단)
@@ -447,6 +507,7 @@ async def _run_monitor():
 
     except Exception as e:
         print(f"❌ 모니터링 오류: {e}")
+        invalidate_targets_cache()  # DB 연결 문제 등이면 다음 회차에 다시 읽도록
         raise HTTPException(status_code=500, detail=str(e))
 
     return {"checked": len(results), "results": results}
@@ -529,6 +590,7 @@ def register_fcm_token(req: FcmTokenRequest):
                     UPDATE targets SET fcm_token = %s WHERE user_id = %s
                 """, (req.token, req.user_id))
             conn.commit()
+        invalidate_targets_cache()
         return {"success": True, "message": "FCM 토큰 등록 완료"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -585,6 +647,7 @@ def add_target(req: TargetRequest):
                 """, (req.user_id, req.port.upper(), req.vessel.upper(), req.fcm_token))
                 created = bool(cur.fetchone()[0])
             conn.commit()
+        invalidate_targets_cache()
         return {"success": True, "created": created}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -601,6 +664,7 @@ def remove_target(req: TargetRequest):
                 )
                 deleted = cur.rowcount > 0
             conn.commit()
+        invalidate_targets_cache()
         return {"success": deleted}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
